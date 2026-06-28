@@ -9,43 +9,34 @@
 
 ## Overview
 
-This repository contains the formal specification, verification report, and hardened security profile of the DEASI Lean4 / RPRK Emissions Controller — a deterministic incentive system designed for on-chain deployment with explicit anti-abuse controls. The architecture couples state-transition logic with a cost function, bounded token emissions, and governance-enforced mutation controls.
+This repository contains the formal specification, verification report, and enhanced control ruleset of the DEASI Lean4 / RPRK Emissions Controller — a deterministic incentive system designed for on-chain deployment with explicit anti-abuse, anti-manipulation, and governance-accountability controls. The architecture now couples state-transition logic with bounded emissions, hysteretic penalties, rate limiting, epoch-safe accounting, and formally stated policy invariants.
 
 ---
 
-## Verified Logic Report
+## Enhanced Ruleset
 
-### 1. State Evolution
+### 1. State Evolution Policy
 
-The system defines three state variables that evolve across discrete time steps:
+Base state evolution remains deterministic:
 
 - **Position:** `pos' = pos + vel`
-- **Velocity:** `vel' = vel` (invariant)
-- **Weight:** `W' = W` (invariant unless governance-approved update at epoch boundary)
+- **Velocity:** `vel' = vel`
+- **Weight:** `W' = W` unless governance-approved update occurs at a valid epoch boundary
 
-All transitions are deterministic. There is no acceleration, stochasticity, or hidden state mutation in the base execution path.
+Additional policy rule:
 
-**Lean 4 Names:** `step_pos`, `step_vel`, `step_weight`
+```
+abs(vel_i) ≤ V_max_i  for every component i
+‖v‖₁ ≤ V_cap
+```
 
----
-
-### 2. Norms and Magnitudes
-
-| Property | Definition | Lean 4 Name |
-|---|---|---|
-| L1 Norm | `‖v‖₁ = Σᵢ |vᵢ|` | `llNorm` |
-| Step Magnitude | `stepMag(v) = ‖v‖₁ / 2` | `stepMag` |
-| L1 Norm Non-negativity | `0 ≤ ‖v‖₁` | `llNorm_nonneg` |
-| Step Mag Non-negativity | `0 ≤ stepMag(v)` | `stepMag_nonneg` |
-| Zero Velocity Lemma | `(∀i, vᵢ=0) ⟹ stepMag(v)=0` | `stepMag_zero_of_zero` |
-
-All norms are provably non-negative. The zero-velocity lemma eliminates edge cases where zero input could produce nonzero cost.
+This adds explicit velocity ceilings so that emission-seeking actors cannot force extreme single-step transitions even if downstream arithmetic remains valid.
 
 ---
 
-### 3. Geometry: Hardened Friction Zone
+### 2. Friction Regime with Hysteresis and Cooldown
 
-Friction now uses a hysteresis band rather than a single threshold.
+Friction uses a two-threshold hysteresis band plus a cooldown timer.
 
 ```
 enterFriction(p) := 1[‖p‖₁ ≥ 10]
@@ -55,165 +46,215 @@ exitFriction(p)  := 1[‖p‖₁ > 8]
 State update rule:
 
 ```
-nextFriction(p, friction_prev) :=
-  if friction_prev = 0 then 1[‖p‖₁ ≥ 10]
+nextFriction(p, friction_prev, cooldown) :=
+  if cooldown > 0 then 1
+  else if friction_prev = 0 then 1[‖p‖₁ ≥ 10]
   else 1[‖p‖₁ > 8]
 ```
 
-This removes one-step boundary oscillation between `‖p‖₁ = 9` and `‖p‖₁ = 10`, because once friction is entered it remains active until position norm is reduced below or equal to 8.
+Cooldown rule:
+
+```
+if friction transitions 0 -> 1 then cooldown := K
+else cooldown := max(cooldown - 1, 0)
+```
+
+This prevents immediate oscillation and also blocks repeated threshold surfing over short horizons.
 
 ---
 
-### 4. Cost Function
+### 3. Cost Function with Anti-Gaming Floors
 
-The hardened cost equation is:
+The enhanced cost equation is:
 
 ```
-C = W_eff · stepMag(v) + F + A_zero
+C = W_eff · stepMag(v) + F + A_zero + A_rate + A_repeat
 ```
 
 Where:
 - `W_eff ≥ W_min > 0`
 - `stepMag(v) = ‖v‖₁ / 2`
-- `F ∈ {0, 1}` is hysteretic friction
-- `A_zero ∈ {0, A_min}` is an anti-zero-cost floor applied whenever `stepMag(v)=0`
+- `F ∈ {0, 1}` is friction
+- `A_zero ∈ {0, A_min}` penalizes zero-motion emission attempts
+- `A_rate ≥ 0` penalizes excessive request frequency inside an epoch
+- `A_repeat ≥ 0` penalizes repeated identical action patterns
 
-Supporting invariants:
+Policy details:
 
-| Constraint | Meaning |
-|---|---|
-| `W_eff ≥ W_min > 0` | Weight cannot be zero in emission-bearing paths |
-| `A_zero = A_min` when `stepMag(v)=0` | Zero-motion cannot mint at maximum rate |
-| `0 ≤ F` | Friction never negative |
-| `0 ≤ C` | Cost always nonnegative |
-| `F ≤ C` | Cost lower-bounds friction |
+```
+A_zero = A_min            if stepMag(v)=0
+A_rate = λ · max(n_calls_epoch - N_free, 0)
+A_repeat = ρ · repeat_score(actor, action_hash_window)
+```
 
-This closes the zero-cost emission path by construction.
+This converts previously binary exploit surfaces into cumulative economic disincentives.
 
 ---
 
-### 5. Phase Hardening
+### 4. Emission Function with Smoothing and Rate Guard
 
-The phase toggle is no longer a bare deterministic boolean for privilege-sensitive flows.
-
-```
-phase' = H(slot_hash, epoch_id, state_root) mod 2
-```
-
-For accounting-only logic, deterministic phase can still be represented internally. For any gating of privileged operations, the effective phase must be derived from a verifiable randomness source or an unpredictable slot-derived commitment.
-
-This removes the ability to sequence actions around a known alternating phase.
-
----
-
-### 6. Emission Map
-
-Emissions decrease linearly as cost increases, with an explicit denominator guard:
+Emission rule:
 
 ```
 assume C_ceil > 0
-E = ⌊ E_max · max(1 − C / C_ceil, 0) ⌋
+E_raw = E_max · max(1 - C / C_ceil, 0)
+E = min( floor(E_raw), E_actor_epoch_remaining, E_system_epoch_remaining )
 ```
 
-Boundary conditions:
+Additional anti-spike rule:
 
-| Condition | Result |
-|---|---|
-| `C = 0` | `E = E_max` only if anti-zero-cost invariants still permit it |
-| `C ≥ C_ceil` | `E = 0` |
-| `C_ceil ≤ 0` | invalid configuration / reject instruction |
+```
+E ≤ E_prev + ΔE_up
+```
 
-The `C_ceil > 0` precondition removes division-by-zero risk completely.
+This means even if cost suddenly falls, emissions cannot jump upward by more than the configured step-up limit `ΔE_up` within one accounting interval. That improves treasury predictability and reduces exploitable reward cliffs.
 
 ---
 
-### 7. Governance Controls
+### 5. Actor-Level Quotas
 
-All mutable economic parameters are now governance-gated.
+In addition to global caps, each actor is subject to local issuance ceilings.
+
+```
+E_actor_epoch_used + E ≤ E_actor_epoch_cap
+E_actor_total_used + E ≤ E_actor_total_cap
+```
+
+Optional stake-scaling:
+
+```
+E_actor_epoch_cap = base_cap + α · stake_score(actor)
+```
+
+This reduces Sybil-style drain risk and improves fairness by preventing one participant from consuming the entire emission budget.
+
+---
+
+### 6. Governance and Parameter Mutation Controls
+
+All mutable economic parameters are governance-gated.
 
 | Parameter | Control |
 |---|---|
 | `T_cap` increase | multi-signature governance only |
 | `W` updates | multi-signature governance only |
 | `C_ceil` updates | multi-signature governance only |
-| friction thresholds | multi-signature governance only |
+| `V_cap` updates | multi-signature governance only |
+| friction thresholds and cooldown | multi-signature governance only |
+| actor quota parameters | multi-signature governance only |
 
-Additional rules:
+Additional change-control rules:
 
 ```
-T_cap_new ≥ T_minted
-T_cap_new ≥ T_cap_old unless governance proposal approved
-W updates only at epoch boundaries
+parameter_change_eta ≥ now + timelock
+proposal_quorum ≥ quorum_min
+emergency_pause expires automatically after pause_window unless renewed by quorum
 ```
 
-This removes unilateral mutation risk and preserves auditability of economic changes.
+This prevents silent economic reconfiguration and improves institutional-grade governance transparency.
 
 ---
 
-### 8. Epoch Rollover Safety
+### 7. Epoch Accounting and Idempotent Settlement
 
-The rollover rule is hardened to one execution per epoch index.
+Rollover and settlement are now keyed by epoch index and settlement nonce.
 
 ```
 if current_epoch > last_rollover_epoch then
   E_epoch := 0
+  actor_epoch_used[*] := 0
   last_rollover_epoch := current_epoch
-else
-  no-op
 ```
 
-This replaces ambiguous slot-threshold resetting with idempotent epoch-index accounting. Multiple instructions in the same slot bundle cannot reset the epoch counter more than once.
+Settlement idempotency:
+
+```
+require nonce not previously consumed
+mark nonce consumed before external mint side effects
+```
+
+This closes duplicate settlement and replay-style issuance risk in concurrent execution environments.
 
 ---
 
-### 9. Canonical Example — v=(2,2), W=3/2
+### 8. Emergency Controls
 
-| Step | Computation | Result |
-|---|---|---|
-| L1 Norm | `‖(2,2)‖₁ = 4` | 4 |
-| Step Magnitude | `4/2 = 2` | 2 |
-| Assume outside friction and nonzero-motion path | `F=0, A_zero=0` | — |
-| Cost | `(3/2)·2 + 0 + 0 = 3` | 3 |
-| Successor Position | `(2,2) + (2,2) = (4,4)` | (4,4) |
+The ruleset adds bounded emergency powers rather than unrestricted admin override.
 
-The canonical example remains unchanged in ordinary non-adversarial motion, which preserves the original economic intuition while hardening edge cases.
+```
+pause_minting ∈ {0,1}
+pause_reason_hash recorded on-chain
+pause_window ≤ P_max unless renewed by governance quorum
+```
 
----
+While paused:
 
-## Security Remediation Status
+```
+E = 0
+state observation continues
+parameter changes limited to recovery-only operations
+```
 
-| Vulnerability | Remediation | Status |
-|---|---|---|
-| Division by zero at `C_ceil` | enforce `C_ceil > 0` and reject invalid config | ✅ Fixed |
-| Zero-cost emission maximization | impose `W_min > 0` and anti-zero-cost floor `A_zero` | ✅ Fixed |
-| Friction boundary oscillation | hysteresis band with sticky exit threshold | ✅ Fixed |
-| Predictable phase manipulation | phase derived from verifiable randomness / slot commitment | ✅ Fixed |
-| Unauthorized cap increase | multi-signature governance gate | ✅ Fixed |
-| Epoch rollover duplicate execution | idempotent epoch-index rollover | ✅ Fixed |
-| Weight mutation mid-epoch | governance-only updates at epoch boundary | ✅ Fixed |
+This allows controlled incident response without creating an unbounded censorship or confiscation vector.
 
 ---
 
-## Formal Verification Delta Required
+### 9. Oracle and External Input Policy
 
-To keep the security claims rigorous, the Lean 4 specification should now add proofs for the following hardened invariants:
+If any external values are used for stake score, randomness seed, or governance state, the controller must enforce source-validation rules.
 
-1. `C_ceil_pos : C_ceil > 0`
-2. `W_min_pos : W_min > 0`
-3. `W_eff_ge_min : W_eff ≥ W_min`
-4. `A_zero_floor : stepMag(v)=0 → A_zero = A_min ∧ A_min > 0`
-5. `hysteresis_no_flip : friction_prev=1 ∧ ‖p‖₁ > 8 → nextFriction(p,1)=1`
-6. `epoch_rollover_idempotent : current_epoch = last_rollover_epoch → E_epoch' = E_epoch`
-7. `gov_only_cap_raise : cap changes require approved governance proof`
-8. `gov_only_weight_update : weight changes require approved governance proof ∧ epoch boundary`
+```
+oracle_value accepted only if
+  source in approved_set ∧
+  update_age ≤ stale_limit ∧
+  deviation ≤ deviation_limit or quorum_override
+```
 
-Until those lemmas are added, the repository should be described as **security-hardened design updated** rather than fully re-verified under the new rules.
+This prevents stale or manipulated external signals from corrupting reward decisions.
+
+---
+
+### 10. Formal Invariant Set
+
+The enhanced ruleset should satisfy the following invariant families:
+
+1. **Non-negativity:** `C ≥ 0`, `E ≥ 0`, penalties ≥ 0
+2. **Bounded issuance:** total minted never exceeds `T_cap`
+3. **Actor fairness:** no actor exceeds local epoch or total caps
+4. **Idempotent settlement:** replaying the same settlement nonce does not increase minted supply
+5. **Governance safety:** mutable parameters cannot change without approved quorum and timelock satisfaction
+6. **Cooldown persistence:** friction remains active through cooldown horizon once triggered
+7. **Velocity boundedness:** no accepted state transition violates `V_cap`
+8. **Pause boundedness:** emergency pause cannot persist indefinitely without quorum renewal
+
+---
+
+## Economic Intent
+
+The enhanced ruleset shifts the controller from a narrow reward formula into a more institutional emission policy engine. In practical terms, it now prices movement, penalizes exploit-like repetition, limits concentration risk, rate-limits issuance jumps, constrains operator power, and ensures each settlement path is replay-safe.
+
+This improves suitability for high-integrity token emission programs, validator incentives, trading-performance rebates, or protocol reward systems where treasury discipline matters as much as raw throughput.
+
+---
+
+## Recommended Lean 4 Proof Extensions
+
+To formally support the enhanced ruleset, add proofs for:
+
+1. `velocity_cap_respected : accepted_step → ‖v‖₁ ≤ V_cap`
+2. `cooldown_persists : cooldown > 0 → nextFriction(...)=1`
+3. `actor_epoch_cap_sound : E_actor_epoch_used + E ≤ E_actor_epoch_cap`
+4. `settlement_nonce_idempotent : consumed(nonce) → minted' = minted`
+5. `rate_guard_sound : E ≤ E_prev + ΔE_up`
+6. `timelock_required : parameter_change → eta_satisfied ∧ quorum_satisfied`
+7. `pause_bounded : pause_active → pause_expiry ≤ P_max unless renewed`
+8. `oracle_freshness : accepted_oracle → update_age ≤ stale_limit`
 
 ---
 
 ## Publication Status
 
-The published repository now reflects the hardened design and marks the former vulnerabilities as remediated at the specification level. Full formal re-verification should be completed after the new invariants and governance assumptions are encoded into Lean 4.
+The published repository now reflects an expanded ruleset with stronger anti-manipulation, actor-fairness, and governance-accountability controls at the specification level. Formal proof coverage should be extended to these new invariants before claiming complete post-enhancement theorem-backed verification.
 
 ---
 
@@ -223,4 +264,4 @@ MIT License — © 2026 Richard Arlie Charles Patterson
 
 ---
 
-*Security-hardened specification for Solana/Anchor deployment. Formal proof delta identified for complete post-hardening verification.*
+*Enhanced specification for Solana/Anchor deployment with stronger issuance discipline, replay safety, and governance controls.*
