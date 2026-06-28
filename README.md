@@ -9,7 +9,7 @@
 
 ## Overview
 
-This repository contains the formal specification, verification report, and vulnerability audit of the DEASI Lean4 / RPRK Emissions Controller — a deterministic, mathematically verified incentive system designed for on-chain deployment (Solana/Anchor). The architecture couples state-transition logic with a cost function and a strictly bounded token emission mechanism.
+This repository contains the formal specification, verification report, and hardened security profile of the DEASI Lean4 / RPRK Emissions Controller — a deterministic incentive system designed for on-chain deployment with explicit anti-abuse controls. The architecture couples state-transition logic with a cost function, bounded token emissions, and governance-enforced mutation controls.
 
 ---
 
@@ -21,9 +21,9 @@ The system defines three state variables that evolve across discrete time steps:
 
 - **Position:** `pos' = pos + vel`
 - **Velocity:** `vel' = vel` (invariant)
-- **Weight:** `W' = W` (invariant)
+- **Weight:** `W' = W` (invariant unless governance-approved update at epoch boundary)
 
-All transitions are deterministic. There is no acceleration, stochasticity, or hidden state mutation. This design guarantees full auditability and predictable on-chain execution costs.
+All transitions are deterministic. There is no acceleration, stochasticity, or hidden state mutation in the base execution path.
 
 **Lean 4 Names:** `step_pos`, `step_vel`, `step_weight`
 
@@ -43,173 +43,177 @@ All norms are provably non-negative. The zero-velocity lemma eliminates edge cas
 
 ---
 
-### 3. Geometry: Friction Zone
+### 3. Geometry: Hardened Friction Zone
 
-Friction activates as a binary state when the L1 position norm crosses a boundary:
+Friction now uses a hysteresis band rather than a single threshold.
 
 ```
-isFrictionZone(p) := 1[‖p‖₁ ≥ 10]
+enterFriction(p) := 1[‖p‖₁ ≥ 10]
+exitFriction(p)  := 1[‖p‖₁ > 8]
 ```
 
-The logical equivalence form used in proofs:
+State update rule:
+
 ```
-isFrictionZone(p) = true ↔ ‖p‖₁ ≥ 10
+nextFriction(p, friction_prev) :=
+  if friction_prev = 0 then 1[‖p‖₁ ≥ 10]
+  else 1[‖p‖₁ > 8]
 ```
 
-**Lean 4 Names:** `isFrictionZone`, `isFrictionZone_iff`
-
-This creates a regime boundary. Inside the zone, a friction penalty `F = 1` is applied. Outside, `F = 0`. The binary nature keeps the cost function linear and avoids discontinuities that could create exploitable edge conditions.
+This removes one-step boundary oscillation between `‖p‖₁ = 9` and `‖p‖₁ = 10`, because once friction is entered it remains active until position norm is reduced below or equal to 8.
 
 ---
 
 ### 4. Cost Function
 
-The primary cost equation:
+The hardened cost equation is:
 
 ```
-C = W · (‖v‖₁ / 2) + F
+C = W_eff · stepMag(v) + F + A_zero
 ```
 
 Where:
-- `W` = weight multiplier (invariant across steps)
-- `‖v‖₁ / 2` = step magnitude (half the L1 velocity norm)
-- `F ∈ {0, 1}` = binary friction penalty
+- `W_eff ≥ W_min > 0`
+- `stepMag(v) = ‖v‖₁ / 2`
+- `F ∈ {0, 1}` is hysteretic friction
+- `A_zero ∈ {0, A_min}` is an anti-zero-cost floor applied whenever `stepMag(v)=0`
 
-**Supporting constraints:**
+Supporting invariants:
 
-| Constraint | Lean 4 Name | Meaning |
-|---|---|---|
-| `F = 1 if friction else 0` | `friction_term` | Binary friction penalty |
-| `0 ≤ F` | `friction_nonneg` | Friction never negative |
-| `0 ≤ C` | `cost_nonneg` | Cost always nonneg |
-| `F ≤ C` | `cost_lower_bound` | Cost ≥ friction penalty |
-| `W·(‖v‖₁/2) ≤ C` | `cost_ge_weight_mul_stepMag` | Cost ≥ kinematic term alone |
+| Constraint | Meaning |
+|---|---|
+| `W_eff ≥ W_min > 0` | Weight cannot be zero in emission-bearing paths |
+| `A_zero = A_min` when `stepMag(v)=0` | Zero-motion cannot mint at maximum rate |
+| `0 ≤ F` | Friction never negative |
+| `0 ≤ C` | Cost always nonnegative |
+| `F ≤ C` | Cost lower-bounds friction |
 
-**Phase tracking:** `phase' = ¬phase` (toggles each step), `nextPhase`  
-**Friction tracking:** `friction' = 1[‖pos+vel‖₁ ≥ 10]`, `nextFriction`
-
----
-
-### 5. Algebraic Reduction
-
-Under parameters `W=2, F=1`:
-
-```
-C = ‖v‖₁ + 1
-```
-
-This collapses cost to a direct linear function of velocity magnitude, eliminating the weight scaling and simplifying formal verification. The identity:
-
-```
-2 · (‖v‖₁ / 2) = ‖v‖₁
-```
-
-Cancels exactly over the rationals `ℚ`, confirming no floating-point rounding errors in the algebraic path.
-
-**Lean 4 Names:** `cost_reduction_calc`, `ring_nf`
+This closes the zero-cost emission path by construction.
 
 ---
 
-### 6. Canonical Example — v=(2,2), W=3/2, F=0
+### 5. Phase Hardening
+
+The phase toggle is no longer a bare deterministic boolean for privilege-sensitive flows.
+
+```
+phase' = H(slot_hash, epoch_id, state_root) mod 2
+```
+
+For accounting-only logic, deterministic phase can still be represented internally. For any gating of privileged operations, the effective phase must be derived from a verifiable randomness source or an unpredictable slot-derived commitment.
+
+This removes the ability to sequence actions around a known alternating phase.
+
+---
+
+### 6. Emission Map
+
+Emissions decrease linearly as cost increases, with an explicit denominator guard:
+
+```
+assume C_ceil > 0
+E = ⌊ E_max · max(1 − C / C_ceil, 0) ⌋
+```
+
+Boundary conditions:
+
+| Condition | Result |
+|---|---|
+| `C = 0` | `E = E_max` only if anti-zero-cost invariants still permit it |
+| `C ≥ C_ceil` | `E = 0` |
+| `C_ceil ≤ 0` | invalid configuration / reject instruction |
+
+The `C_ceil > 0` precondition removes division-by-zero risk completely.
+
+---
+
+### 7. Governance Controls
+
+All mutable economic parameters are now governance-gated.
+
+| Parameter | Control |
+|---|---|
+| `T_cap` increase | multi-signature governance only |
+| `W` updates | multi-signature governance only |
+| `C_ceil` updates | multi-signature governance only |
+| friction thresholds | multi-signature governance only |
+
+Additional rules:
+
+```
+T_cap_new ≥ T_minted
+T_cap_new ≥ T_cap_old unless governance proposal approved
+W updates only at epoch boundaries
+```
+
+This removes unilateral mutation risk and preserves auditability of economic changes.
+
+---
+
+### 8. Epoch Rollover Safety
+
+The rollover rule is hardened to one execution per epoch index.
+
+```
+if current_epoch > last_rollover_epoch then
+  E_epoch := 0
+  last_rollover_epoch := current_epoch
+else
+  no-op
+```
+
+This replaces ambiguous slot-threshold resetting with idempotent epoch-index accounting. Multiple instructions in the same slot bundle cannot reset the epoch counter more than once.
+
+---
+
+### 9. Canonical Example — v=(2,2), W=3/2
 
 | Step | Computation | Result |
 |---|---|---|
 | L1 Norm | `‖(2,2)‖₁ = 4` | 4 |
 | Step Magnitude | `4/2 = 2` | 2 |
-| Cost | `(3/2)·2 + 0 = 3` | 3 |
+| Assume outside friction and nonzero-motion path | `F=0, A_zero=0` | — |
+| Cost | `(3/2)·2 + 0 + 0 = 3` | 3 |
 | Successor Position | `(2,2) + (2,2) = (4,4)` | (4,4) |
 
-**Lean 4 Names:** `sample_llNorm`, `sample_stepMag`, `sample_cost`, `sample_step_pos`
+The canonical example remains unchanged in ordinary non-adversarial motion, which preserves the original economic intuition while hardening edge cases.
 
 ---
 
-### 7. RPRK Emission Map
+## Security Remediation Status
 
-Emissions decrease linearly as cost increases:
-
-```
-E = ⌊ E_max · (1 − C / C_ceil) ⌋
-```
-
-**Boundary conditions:**
-
-| Condition | Result | Lean 4 Name |
+| Vulnerability | Remediation | Status |
 |---|---|---|
-| `C = 0` | `E = E_max` | `RPRK_boundary_low` |
-| `C ≥ C_ceil` | `E = 0` | `RPRK_boundary_high` |
-
-The floor function ensures integer emission values. Emissions are strictly non-negative by construction.
-
----
-
-### 8. On-Chain Supply Constraints (Solana / Anchor)
-
-Three hard caps govern all emission behavior:
-
-```
-1. E_epoch + E ≤ E_max/epoch       (per-epoch cap)
-2. T + E ≤ T_cap                   (lifetime total cap)
-3. T_cap_new ≥ T_minted            (cap monotonicity)
-4. slots ≥ epoch_dur ⟹ E_epoch ← 0  (epoch rollover)
-```
-
-**Lean 4 Names:** `EpochCapExceeded`, `TotalCapExceeded`, `CapBelowMinted`, `epoch_rollover`
-
-These constraints guarantee:
-- No per-epoch over-issuance
-- No lifetime over-issuance
-- The supply ceiling cannot be lowered below already-minted supply
-- Epoch counters reset cleanly on rollover
+| Division by zero at `C_ceil` | enforce `C_ceil > 0` and reject invalid config | ✅ Fixed |
+| Zero-cost emission maximization | impose `W_min > 0` and anti-zero-cost floor `A_zero` | ✅ Fixed |
+| Friction boundary oscillation | hysteresis band with sticky exit threshold | ✅ Fixed |
+| Predictable phase manipulation | phase derived from verifiable randomness / slot commitment | ✅ Fixed |
+| Unauthorized cap increase | multi-signature governance gate | ✅ Fixed |
+| Epoch rollover duplicate execution | idempotent epoch-index rollover | ✅ Fixed |
+| Weight mutation mid-epoch | governance-only updates at epoch boundary | ✅ Fixed |
 
 ---
 
-## Vulnerability Audit
+## Formal Verification Delta Required
 
-### Audit Scope
-All 31 logical assertions in the specification were reviewed for the following vulnerability classes:
+To keep the security claims rigorous, the Lean 4 specification should now add proofs for the following hardened invariants:
 
-1. **Integer overflow / underflow** — All quantities are non-negative by proof. `C ≥ 0`, `F ≥ 0`, `E ≥ 0`. No subtraction is performed without a proven lower bound.
+1. `C_ceil_pos : C_ceil > 0`
+2. `W_min_pos : W_min > 0`
+3. `W_eff_ge_min : W_eff ≥ W_min`
+4. `A_zero_floor : stepMag(v)=0 → A_zero = A_min ∧ A_min > 0`
+5. `hysteresis_no_flip : friction_prev=1 ∧ ‖p‖₁ > 8 → nextFriction(p,1)=1`
+6. `epoch_rollover_idempotent : current_epoch = last_rollover_epoch → E_epoch' = E_epoch`
+7. `gov_only_cap_raise : cap changes require approved governance proof`
+8. `gov_only_weight_update : weight changes require approved governance proof ∧ epoch boundary`
 
-2. **Division by zero** — `C_ceil` appears in the denominator of the emission formula. The specification does not explicitly prove `C_ceil > 0`. **Recommendation:** Add a precondition `C_ceil_pos : C_ceil > 0` to all lemmas involving the emission formula.
-
-3. **Emission inflation via zero-cost gaming** — At `C = 0`, `E = E_max`. An actor who can consistently drive cost to zero maximizes emissions indefinitely. This is partially mitigated by the per-epoch cap and total cap, but the `F = 0` path (outside friction zone, zero weight) deserves explicit invariant protection.
-
-4. **Friction zone boundary straddling** — The friction condition is `‖p‖₁ ≥ 10`. An actor at exactly `‖p‖₁ = 9` can oscillate in and out of the friction zone by choosing velocity directions strategically, toggling `F` between 0 and 1 each step and exploiting the difference in cost to optimize emissions. **Recommendation:** Consider a hysteresis band (e.g., enter zone at 10, exit only at 8) or a smoothed friction function.
-
-5. **Phase toggle manipulation** — `phase' = ¬phase` is a deterministic toggle with no external guard. If phase is used downstream to unlock functionality, an actor can predict and sequence actions to always hit a favorable phase. **Recommendation:** Add entropy or a VRF seed to phase if it gates privileged operations.
-
-6. **Cap monotonicity enforcement** — `T_cap_new ≥ T_minted` prevents the cap from being lowered below minted supply, but does not prevent the cap from being raised without governance approval. If the cap is mutable, ensure cap-increase operations require multi-signature authorization.
-
-7. **Epoch rollover race condition** — The rollover condition `slots ≥ epoch_dur ⟹ E_epoch ← 0` relies on slot-based timing. On Solana, slot timing is not perfectly uniform. Ensure the rollover is checked at instruction entry and cannot be triggered multiple times within the same transaction bundle.
-
-8. **Weight invariance assumption** — `W' = W` is asserted but not enforced by a smart contract access control rule. If `W` is a mutable account field, a privileged authority could update it mid-epoch. **Recommendation:** Add an immutability constraint or require governance-gated weight updates.
+Until those lemmas are added, the repository should be described as **security-hardened design updated** rather than fully re-verified under the new rules.
 
 ---
 
-## Formal Verification Status
+## Publication Status
 
-| Module | Assertions | Status |
-|---|---|---|
-| Norms & Magnitudes | 5 | ✅ Verified |
-| Geometry | 2 | ✅ Verified |
-| Dynamics | 5 | ✅ Verified |
-| Cost Function | 6 | ✅ Verified |
-| Algebraic Reduction | 2 | ✅ Verified |
-| Canonical Example | 4 | ✅ Verified |
-| RPRK Emission Map | 3 | ✅ Verified |
-| On-Chain Constraints | 4 | ✅ Verified |
-| **Total** | **31** | **✅ All Pass** |
-
----
-
-## Recommended Mitigations
-
-1. Add `C_ceil_pos` precondition to emission lemmas
-2. Implement friction hysteresis band to prevent boundary oscillation
-3. Protect phase toggle with VRF if used in privileged gating
-4. Require governance multi-sig for cap increases
-5. Guard epoch rollover against duplicate execution within the same slot bundle
-6. Add access control to weight mutation if `W` is a mutable on-chain field
+The published repository now reflects the hardened design and marks the former vulnerabilities as remediated at the specification level. Full formal re-verification should be completed after the new invariants and governance assumptions are encoded into Lean 4.
 
 ---
 
@@ -219,4 +223,4 @@ MIT License — © 2026 Richard Arlie Charles Patterson
 
 ---
 
-*Specification formally verified in Lean 4. On-chain implementation targets Solana/Anchor. All rights reserved.*
+*Security-hardened specification for Solana/Anchor deployment. Formal proof delta identified for complete post-hardening verification.*
