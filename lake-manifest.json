@@ -1,0 +1,51 @@
+{
+  "version": "1.1.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    {
+      "type": "git",
+      "name": "mathlib",
+      "url": "https://github.com/leanprover-community/mathlib4",
+      "rev": "v4.14.0",
+      "inputRev": "v4.14.0",
+      "inherited": false,
+      "configFile": "lakefile.toml"
+    },
+    {
+      "type": "git",
+      "name": "Qq",
+      "url": "https://github.com/leanprover-community/quote4",
+      "rev": "master",
+      "inputRev": null,
+      "inherited": true,
+      "configFile": "lakefile.lean"
+    },
+    {
+      "type": "git",
+      "name": "aesop",
+      "url": "https://github.com/leanprover-community/aesop",
+      "rev": "master",
+      "inputRev": null,
+      "inherited": true,
+      "configFile": "lakefile.lean"
+    },
+    {
+      "type": "git",
+      "name": "proofwidgets",
+      "url": "https://github.com/leanprover-community/ProofWidgets4",
+      "rev": "master",
+      "inputRev": null,
+      "inherited": true,
+      "configFile": "lakefile.lean"
+    },
+    {
+      "type": "git",
+      "name": "importGraph",
+      "url": "https://github.com/leanprover-community/import-graph",
+      "rev": "master",
+      "inputRev": null,
+      "inherited": true,
+      "configFile": "lakefile.lean"
+    }
+  ]
+}
